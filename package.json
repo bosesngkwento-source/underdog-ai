@@ -11,8 +11,10 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@discordjs/rest": "^2.4.3",
     "@google/genai": "^1.0.0",
     "better-sqlite3": "^11.7.0",
+    "discord-api-types": "^0.37.120",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.7"
   }
