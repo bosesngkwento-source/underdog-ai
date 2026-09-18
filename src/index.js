@@ -12,71 +12,57 @@ const {
 const Database = require("better-sqlite3");
 const { GoogleGenAI } = require("@google/genai");
 
-// =====================================================
-// CONFIG
-// =====================================================
+// =========================
+// ENVIRONMENT
+// =========================
 
-const REQUIRED_ENV = [
-  "DISCORD_TOKEN",
-  "DISCORD_CLIENT_ID",
-  "DISCORD_GUILD_ID",
-  "GEMINI_API_KEY",
-];
-
-for (const key of REQUIRED_ENV) {
-  if (!process.env[key]) {
-    console.error(`Missing environment variable: ${key}`);
-    process.exit(1);
-  }
-}
+const {
+  DISCORD_TOKEN,
+  DISCORD_CLIENT_ID,
+  DISCORD_GUILD_ID,
+  GEMINI_API_KEY,
+} = process.env;
 
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
+if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
+if (!DISCORD_CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID");
+if (!DISCORD_GUILD_ID) throw new Error("Missing DISCORD_GUILD_ID");
+if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
 
-// ONLY THESE TWO ROLES CAN CONTROL STAFF FEATURES
+// =========================
+// CONFIG
+// =========================
+
 const STAFF_ROLE_IDS = new Set([
   "1530288888411852891", // Admin
   "1530288809932099634", // Head Admin
 ]);
 
-// Actions Underdog is NEVER allowed to perform
-const BLOCKED_ACTIONS = [
-  "ban",
-  "ban member",
-  "kick",
-  "kick member",
-  "timeout",
-  "unban",
-];
-
-// =====================================================
-// GEMINI
-// =====================================================
-
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
-
-// =====================================================
-// DISCORD CLIENT
-// =====================================================
+const BOT_PREFIX = "Underdog AI";
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel],
+  partials: [
+    Partials.Channel,
+    Partials.Message,
+    Partials.GuildMember,
+  ],
 });
 
-// =====================================================
+const ai = new GoogleGenAI({
+  apiKey: GEMINI_API_KEY,
+});
+
+// =========================
 // DATABASE
-// =====================================================
+// =========================
 
 const db = new Database("underdog.sqlite");
 
@@ -85,49 +71,51 @@ db.pragma("journal_mode = WAL");
 db.exec(`
 CREATE TABLE IF NOT EXISTS memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  category TEXT,
+  guild_id TEXT NOT NULL,
+  category TEXT NOT NULL,
   content TEXT NOT NULL,
-  source_user_id TEXT,
-  source_username TEXT,
+  created_by TEXT,
   created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT
+  guild_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT,
+  PRIMARY KEY (guild_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL,
   task TEXT NOT NULL,
   created_by TEXT,
-  channel_id TEXT,
   due_at INTEGER,
   completed INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS indexed_messages (
-  message_id TEXT PRIMARY KEY,
-  channel_id TEXT,
-  indexed_at INTEGER NOT NULL
+  guild_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  PRIMARY KEY (guild_id, message_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_memories_category
-ON memories(category);
-
-CREATE INDEX IF NOT EXISTS idx_memories_created
-ON memories(created_at);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_due
-ON tasks(due_at);
+CREATE TABLE IF NOT EXISTS warnings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  moderator_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `);
 
-// =====================================================
+// =========================
 // HELPERS
-// =====================================================
+// =========================
 
-function clip(text, max = 2000) {
+function clip(text, max = 5000) {
   if (!text) return "";
   return String(text).slice(0, max);
 }
@@ -136,26 +124,23 @@ function randomItem(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function getSetting(key, fallback = null) {
-  const row = db
-    .prepare("SELECT value FROM settings WHERE key = ?")
-    .get(key);
-
-  return row?.value ?? fallback;
+function getSetting(guildId, key) {
+  return db
+    .prepare(
+      `SELECT value FROM settings
+       WHERE guild_id = ? AND key = ?`
+    )
+    .get(guildId, key)?.value;
 }
 
-function setSetting(key, value) {
+function setSetting(guildId, key, value) {
   db.prepare(`
-    INSERT INTO settings (key, value)
-    VALUES (?, ?)
-    ON CONFLICT(key)
+    INSERT INTO settings (guild_id, key, value)
+    VALUES (?, ?, ?)
+    ON CONFLICT(guild_id, key)
     DO UPDATE SET value = excluded.value
-  `).run(key, String(value));
+  `).run(guildId, key, value);
 }
-
-// =====================================================
-// STAFF PERMISSIONS
-// =====================================================
 
 function isAuthorizedStaff(member) {
   if (!member) return false;
@@ -165,612 +150,971 @@ function isAuthorizedStaff(member) {
   );
 }
 
-function isBotOwnerOrAdmin(member) {
-  return isAuthorizedStaff(member);
+function hasBotPermission(guild, permission) {
+  const me = guild.members.me;
+  if (!me) return false;
+
+  return me.permissions.has(permission);
 }
 
-// =====================================================
+function cleanBotMention(text) {
+  return text
+    .replace(/<@!?\d+>/g, "")
+    .trim();
+}
+
+// =========================
 // MEMORY
-// =====================================================
+// =========================
 
 function saveMemory(
+  guildId,
   category,
   content,
-  userId = null,
-  username = null
+  createdBy = null
 ) {
-  if (!content || !content.trim()) return;
-
   db.prepare(`
     INSERT INTO memories
-    (category, content, source_user_id, source_username, created_at)
+    (guild_id, category, content, created_by, created_at)
     VALUES (?, ?, ?, ?, ?)
   `).run(
-    category || "general",
-    clip(content, 4000),
-    userId,
-    username,
+    guildId,
+    category,
+    clip(content, 10000),
+    createdBy,
     Date.now()
   );
 }
 
-function searchMemories(query, limit = 12) {
+function deleteMemory(guildId, id) {
+  return db.prepare(`
+    DELETE FROM memories
+    WHERE guild_id = ? AND id = ?
+  `).run(guildId, id);
+}
+
+function searchMemories(guildId, query, limit = 12) {
   const words = query
     .toLowerCase()
-    .replace(/[^\w\s]/g, " ")
     .split(/\s+/)
-    .filter((word) => word.length >= 3)
+    .filter((x) => x.length > 2)
     .slice(0, 8);
 
   if (!words.length) {
-    return db
-      .prepare(`
-        SELECT *
-        FROM memories
-        ORDER BY created_at DESC
-        LIMIT ?
-      `)
-      .all(limit);
-  }
-
-  const conditions = words
-    .map(() => "(LOWER(content) LIKE ? OR LOWER(category) LIKE ?)")
-    .join(" OR ");
-
-  const params = [];
-
-  for (const word of words) {
-    const value = `%${word}%`;
-    params.push(value, value);
-  }
-
-  params.push(limit);
-
-  return db
-    .prepare(`
-      SELECT *
-      FROM memories
-      WHERE ${conditions}
+    return db.prepare(`
+      SELECT * FROM memories
+      WHERE guild_id = ?
       ORDER BY created_at DESC
       LIMIT ?
-    `)
-    .all(...params);
+    `).all(guildId, limit);
+  }
+
+  const rows = db.prepare(`
+    SELECT * FROM memories
+    WHERE guild_id = ?
+    ORDER BY created_at DESC
+    LIMIT 300
+  `).all(guildId);
+
+  const scored = rows.map((row) => {
+    const lower = row.content.toLowerCase();
+
+    let score = 0;
+
+    for (const word of words) {
+      if (lower.includes(word)) score++;
+    }
+
+    return {
+      ...row,
+      score,
+    };
+  });
+
+  return scored
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }
 
 function formatMemories(rows) {
-  if (!rows.length) return "No relevant memories found.";
+  if (!rows.length) {
+    return "I don't have anything relevant stored.";
+  }
 
   return rows
     .map(
-      (row, index) =>
-        `${index + 1}. [${row.category}] ${row.content}`
+      (m) =>
+        `[#${m.id}] [${m.category}] ${m.content}`
     )
     .join("\n");
 }
 
-// =====================================================
-// PERSONALITY
-// =====================================================
+// =========================
+// GEMINI
+// =========================
 
-function getPersonality() {
-  return getSetting(
-    "personality",
+async function generateAI(prompt, options = {}) {
+  const response = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: prompt,
+    config: {
+      temperature:
+        options.temperature ?? 0.75,
+      maxOutputTokens:
+        options.maxOutputTokens ?? 500,
+    },
+  });
+
+  return response.text?.trim() || "";
+}
+
+// =========================
+// PERSONALITY
+// =========================
+
+function getPersonality(guildId) {
+  return (
+    getSetting(guildId, "personality") ||
     `
 You are Underdog AI, the AI assistant for a Roblox boxing Discord server.
 
 Personality:
-- Helpful
+- Friendly
 - Energetic
-- Short replies
-- Boxing/gaming personality
-- Uses casual slang naturally
-- Can be sarcastic and slightly mean in a harmless joking way
+- Boxing/gaming style
+- Short and natural replies
+- Can use casual slang
+- Can lightly tease users
 - Can make harmless jokes
-- Can use occasional light dark humor
-- Never target protected groups
-- Never threaten people
-- Never encourage dangerous behavior
-- Never make serious abusive statements
-- Never pretend to know information you do not have
-- If server information is unknown, say you don't know
-- Respect authorized staff instructions
-- Human staff remain in control
-
-Keep normal responses concise.
+- Do not become hateful, threatening, or seriously abusive
+- Be professional when handling moderation or tickets
+- Never invent server information
+- If information is unknown, say you do not know
 `
   );
 }
 
-// =====================================================
-// GEMINI RESPONSE
-// =====================================================
+// =========================
+// NORMAL AI ANSWERS
+// =========================
 
-async function generateAnswer({
-  userMessage,
-  memoryContext = "",
-  staffContext = "",
-}) {
+async function answerUser(guild, member, question) {
+  const memories = searchMemories(
+    guild.id,
+    question,
+    15
+  );
+
+  const memoryText = formatMemories(memories);
+
   const prompt = `
-${getPersonality()}
+${getPersonality(guild.id)}
 
-SERVER MEMORY:
-${memoryContext || "No relevant memory found."}
+You are answering a Discord user.
 
-STAFF CONTEXT:
-${staffContext || "No special staff instruction."}
+Server:
+${guild.name}
 
-USER MESSAGE:
-${userMessage}
+User:
+${member?.displayName || "Unknown"}
 
-Answer the user.
-Do not invent server facts.
-If the information is not in the memory or message, say you don't know.
-Keep the response short and natural.
+Relevant stored server information:
+${memoryText}
+
+Question:
+${question}
+
+Rules:
+- Use stored information when relevant.
+- Do not invent facts about this server.
+- If the stored information does not answer the question, say you don't know.
+- Keep the response reasonably short.
+`;
+
+  return generateAI(prompt);
+}
+
+// =========================
+// MEMORY CLASSIFICATION
+// =========================
+
+async function classifyForMemory(message) {
+  const prompt = `
+Determine whether this Discord message contains important
+long-term server information that should be remembered.
+
+Important information includes:
+- Rules
+- Announcements
+- Updates
+- Patch notes
+- Events
+- Tournament information
+- Rankings
+- P4P rankings
+- Fighter records
+- Belt holders
+- Hall of Fame
+- Staff decisions
+- Important server procedures
+
+Do NOT save:
+- Casual conversation
+- Jokes
+- Greetings
+- Random opinions
+- Temporary chatter
+- Ordinary questions
+
+Return JSON only:
+
+{
+  "save": true or false,
+  "category": "rules|announcement|update|event|ranking|fighter|staff|other",
+  "reason": "short reason"
+}
+
+Message:
+${clip(message, 4000)}
 `;
 
   try {
-    const result = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: prompt,
-      config: {
-        temperature: 0.8,
-        maxOutputTokens: 250,
-      },
+    const text = await generateAI(prompt, {
+      temperature: 0.1,
+      maxOutputTokens: 200,
     });
 
-    const text =
-      result?.text ||
-      result?.response?.text?.() ||
-      "";
+    const cleaned = text
+      .replace(/```json/gi, "")
+      .replace(/```/g, "")
+      .trim();
 
-    return clip(text.trim(), 900) ||
-      "My brain just disconnected for a second. 💀";
-  } catch (error) {
-    console.error("Gemini error:", error);
-
-    return "My AI brain is having a boxing match with the API right now. 💀";
-  }
-}
-
-// =====================================================
-// MEMORY CLASSIFICATION
-// =====================================================
-
-async function classifyForMemory(content) {
-  try {
-    const result = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: `
-Decide whether this Discord message contains important long-term
-server information worth remembering.
-
-Save things such as:
-- rules
-- announcements
-- updates
-- patch notes
-- events
-- rankings
-- P4P rankings
-- champions
-- belt holders
-- fighter records
-- Hall of Fame
-- staff decisions
-- important server information
-
-Do NOT save:
-- casual chat
-- greetings
-- random jokes
-- ordinary conversation
-- meaningless messages
-
-Reply exactly:
-SAVE|category|reason
-or
-IGNORE
-
-MESSAGE:
-${clip(content, 3000)}
-`,
-      config: {
-        temperature: 0,
-        maxOutputTokens: 80,
-      },
-    });
-
-    const text =
-      result?.text ||
-      result?.response?.text?.() ||
-      "";
-
-    const clean = text.trim();
-
-    if (!clean.startsWith("SAVE|")) {
-      return null;
-    }
-
-    const parts = clean.split("|");
-
+    return JSON.parse(cleaned);
+  } catch {
     return {
-      category: parts[1] || "general",
-      reason: parts.slice(2).join("|") || content,
+      save: false,
+      category: "other",
+      reason: "classification failed",
     };
-  } catch (error) {
-    console.error("Memory classification error:", error);
-    return null;
   }
 }
 
-// =====================================================
-// INDEXING
-// =====================================================
-
-function messageAlreadyIndexed(messageId) {
-  return !!db
-    .prepare(
-      "SELECT message_id FROM indexed_messages WHERE message_id = ?"
-    )
-    .get(messageId);
-}
-
-function markMessageIndexed(message) {
-  db.prepare(`
-    INSERT OR IGNORE INTO indexed_messages
-    (message_id, channel_id, indexed_at)
-    VALUES (?, ?, ?)
-  `).run(
-    message.id,
-    message.channel.id,
-    Date.now()
-  );
-}
+// =========================
+// CHANNEL INDEXING
+// =========================
 
 async function indexChannel(channel, maxMessages = 100) {
   if (!channel?.isTextBased()) {
     return 0;
   }
 
-  let totalIndexed = 0;
   let lastId;
+  let indexed = 0;
 
-  while (totalIndexed < maxMessages) {
+  while (indexed < maxMessages) {
     const remaining = Math.min(
       100,
-      maxMessages - totalIndexed
+      maxMessages - indexed
     );
 
-    const options = {
+    const messages = await channel.messages.fetch({
       limit: remaining,
-    };
-
-    if (lastId) {
-      options.before = lastId;
-    }
-
-    const messages = await channel.messages.fetch(options);
+      ...(lastId ? { before: lastId } : {}),
+    });
 
     if (!messages.size) break;
 
-    for (const message of messages.values()) {
+    const ordered = [...messages.values()].reverse();
+
+    for (const message of ordered) {
+      lastId = message.id;
+
       if (message.author.bot) continue;
 
-      if (messageAlreadyIndexed(message.id)) {
-        continue;
-      }
+      const exists = db
+        .prepare(`
+          SELECT 1 FROM indexed_messages
+          WHERE guild_id = ? AND message_id = ?
+        `)
+        .get(
+          channel.guild.id,
+          message.id
+        );
 
-      if (message.content?.trim()) {
-        const classification =
-          await classifyForMemory(message.content);
+      if (exists) continue;
 
-        if (classification) {
-          saveMemory(
-            classification.category,
-            message.content,
-            message.author.id,
-            message.author.username
-          );
-        }
-      }
+      const result =
+        await classifyForMemory(message.content);
 
-      markMessageIndexed(message);
-      totalIndexed++;
-
-      // Small delay to reduce API pressure
-      await new Promise((resolve) =>
-        setTimeout(resolve, 150)
-      );
-    }
-
-    lastId =
-      messages.last()?.id;
-
-    if (messages.size < remaining) break;
-  }
-
-  return totalIndexed;
-}
-
-// =====================================================
-// TASK SYSTEM
-// =====================================================
-
-function createTask(
-  task,
-  createdBy,
-  channelId,
-  dueAt = null
-) {
-  const result = db.prepare(`
-    INSERT INTO tasks
-    (task, created_by, channel_id, due_at, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(
-    clip(task, 1000),
-    createdBy,
-    channelId,
-    dueAt,
-    Date.now()
-  );
-
-  return result.lastInsertRowid;
-}
-
-function getActiveTasks() {
-  return db
-    .prepare(`
-      SELECT *
-      FROM tasks
-      WHERE completed = 0
-      ORDER BY
-        CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
-        due_at ASC,
-        created_at DESC
-    `)
-    .all();
-}
-
-function completeTask(id) {
-  return db
-    .prepare(`
-      UPDATE tasks
-      SET completed = 1
-      WHERE id = ?
-    `)
-    .run(id);
-}
-
-function deleteTask(id) {
-  return db
-    .prepare(`
-      DELETE FROM tasks
-      WHERE id = ?
-    `)
-    .run(id);
-}
-
-// =====================================================
-// TASK REMINDERS
-// =====================================================
-
-async function checkTasks() {
-  const now = Date.now();
-
-  const tasks = db
-    .prepare(`
-      SELECT *
-      FROM tasks
-      WHERE completed = 0
-      AND due_at IS NOT NULL
-      AND due_at <= ?
-    `)
-    .all(now);
-
-  for (const task of tasks) {
-    try {
-      const channel =
-        await client.channels.fetch(task.channel_id);
-
-      if (channel?.isTextBased()) {
-        await channel.send(
-          `⏰ **TASK REMINDER**\n${task.task}`
+      if (result.save) {
+        saveMemory(
+          channel.guild.id,
+          result.category,
+          `[${channel.name}] ${message.content}`,
+          message.author.id
         );
       }
 
       db.prepare(`
-        UPDATE tasks
-        SET due_at = NULL
-        WHERE id = ?
-      `).run(task.id);
-    } catch (error) {
-      console.error(
-        `Task reminder error for ${task.id}:`,
-        error
+        INSERT OR IGNORE INTO indexed_messages
+        (guild_id, message_id)
+        VALUES (?, ?)
+      `).run(
+        channel.guild.id,
+        message.id
       );
+
+      indexed++;
+
+      if (indexed >= maxMessages) break;
     }
+
+    if (messages.size < remaining) break;
   }
+
+  return indexed;
 }
 
-setInterval(checkTasks, 30_000);
+// =========================
+// MEMBER INFORMATION
+// =========================
 
-// =====================================================
-// STAFF-DIRECTED ANNOUNCEMENT SYSTEM
-// =====================================================
+function getMemberInformation(member) {
+  if (!member) return "Member not found.";
 
-async function handleStaffInstruction(message, instruction) {
-  if (!isAuthorizedStaff(message.member)) {
-    await message.reply(
-      "Nice try, champ. 💀 Staff-directed commands are only available to Admin and Head Admin."
-    );
-    return;
+  const roles = member.roles.cache
+    .filter((role) => role.id !== member.guild.id)
+    .map((role) => role.name)
+    .join(", ") || "None";
+
+  const accountCreated =
+    `<t:${Math.floor(
+      member.user.createdTimestamp / 1000
+    )}:F>`;
+
+  const joined =
+    member.joinedTimestamp
+      ? `<t:${Math.floor(
+          member.joinedTimestamp / 1000
+        )}:F>`
+      : "Unknown";
+
+  return `
+👤 **${member.user.tag}**
+
+ID: \`${member.id}\`
+Display Name: ${member.displayName}
+Account Created: ${accountCreated}
+Joined Server: ${joined}
+Roles: ${roles}
+Bot: ${member.user.bot ? "Yes" : "No"}
+Nickname: ${member.nickname || "None"}
+`;
+}
+
+// =========================
+// WARNINGS
+// =========================
+
+function addWarning(
+  guildId,
+  userId,
+  moderatorId,
+  reason
+) {
+  db.prepare(`
+    INSERT INTO warnings
+    (guild_id, user_id, moderator_id, reason, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    guildId,
+    userId,
+    moderatorId,
+    clip(reason, 1000),
+    Date.now()
+  );
+}
+
+function getWarnings(guildId, userId) {
+  return db.prepare(`
+    SELECT *
+    FROM warnings
+    WHERE guild_id = ?
+      AND user_id = ?
+    ORDER BY created_at DESC
+  `).all(guildId, userId);
+}
+
+// =========================
+// ROLE MANAGEMENT
+// =========================
+
+async function renameRole(
+  guild,
+  role,
+  newName,
+  executor
+) {
+  if (!isAuthorizedStaff(executor)) {
+    return {
+      ok: false,
+      message: "You aren't authorized to manage roles.",
+    };
   }
 
-  const lower = instruction.toLowerCase();
+  const botMember = guild.members.me;
 
-  // NEVER allow these actions
-  if (
-    BLOCKED_ACTIONS.some((action) =>
-      lower.includes(action)
-    )
-  ) {
-    await message.reply(
-      "I can't perform ban, kick, timeout, or unban actions. Those controls stay with human staff."
-    );
-    return;
+  if (!botMember) {
+    return {
+      ok: false,
+      message: "I can't determine my role hierarchy.",
+    };
   }
 
-  const wantsAnnouncement =
-    lower.includes("announce") ||
-    lower.includes("announcement") ||
-    lower.includes("post this") ||
-    lower.includes("send this");
-
-  if (!wantsAnnouncement) {
-    return false;
+  if (role.managed) {
+    return {
+      ok: false,
+      message: "That role is managed by Discord/integration and cannot be renamed.",
+    };
   }
 
-  const targetChannel =
-    message.mentions.channels.first();
-
-  if (!targetChannel) {
-    await message.reply(
-      "Tell me which channel to post it in, champ. Example: `@Underdog AI announce in #announcements Tournament starts at 8 PM.`"
-    );
-    return true;
+  if (role.position >= botMember.roles.highest.position) {
+    return {
+      ok: false,
+      message: "That role is above or equal to my highest role.",
+    };
   }
-
-  if (!targetChannel.isTextBased()) {
-    await message.reply(
-      "That isn't a text channel I can post in."
-    );
-    return true;
-  }
-
-  const botMember = message.guild.members.me;
-
-  const permissions =
-    targetChannel.permissionsFor(botMember);
-
-  if (
-    !permissions?.has(
-      PermissionFlagsBits.ViewChannel
-    ) ||
-    !permissions?.has(
-      PermissionFlagsBits.SendMessages
-    )
-  ) {
-    await message.reply(
-      `I don't have permission to send messages in ${targetChannel}.`
-    );
-    return true;
-  }
-
-  let announcement = instruction
-    .replace(/<#[0-9]+>/g, "")
-    .replace(/<@!?\d+>/g, "")
-    .replace(/announce(ment)?/gi, "")
-    .replace(/post this/gi, "")
-    .replace(/send this/gi, "")
-    .trim();
-
-  if (!announcement) {
-    await message.reply(
-      "You told me to announce something but gave me nothing to announce. 💀"
-    );
-    return true;
-  }
-
-  // Ask Gemini to clean the announcement
-  const formattedAnnouncement =
-    await generateAnnouncement(announcement);
 
   try {
-    await targetChannel.send({
-      content: formattedAnnouncement,
-      allowedMentions: {
-        parse: [],
-      },
-    });
+    await role.setName(newName);
 
-    saveMemory(
-      "announcement",
-      announcement,
-      message.author.id,
-      message.author.username
-    );
-
-    await message.reply(
-      `Posted it in ${targetChannel}. 🥊`
-    );
+    return {
+      ok: true,
+      message: `Renamed **${role.name}** to **${newName}**.`,
+    };
   } catch (error) {
-    console.error("Announcement error:", error);
+    console.error(error);
 
-    await message.reply(
-      "I couldn't post that announcement. Check my permissions in that channel."
-    );
+    return {
+      ok: false,
+      message: "I couldn't rename that role. Check my Manage Roles permission.",
+    };
   }
-
-  return true;
 }
 
-// =====================================================
-// ANNOUNCEMENT AI FORMATTER
-// =====================================================
+// =========================
+// KICK
+// =========================
+
+async function kickMember(
+  guild,
+  target,
+  executor,
+  reason
+) {
+  if (!isAuthorizedStaff(executor)) {
+    return {
+      ok: false,
+      message: "You aren't authorized to kick members.",
+    };
+  }
+
+  const botMember = guild.members.me;
+
+  if (!botMember.permissions.has(
+    PermissionFlagsBits.KickMembers
+  )) {
+    return {
+      ok: false,
+      message: "I don't have the Kick Members permission.",
+    };
+  }
+
+  if (!target) {
+    return {
+      ok: false,
+      message: "I couldn't find that member.",
+    };
+  }
+
+  if (target.id === executor.id) {
+    return {
+      ok: false,
+      message: "You can't kick yourself through me.",
+    };
+  }
+
+  if (target.id === client.user.id) {
+    return {
+      ok: false,
+      message: "Nice try. I'm not kicking myself.",
+    };
+  }
+
+  if (
+    target.roles.highest.position >=
+    botMember.roles.highest.position
+  ) {
+    return {
+      ok: false,
+      message: "That member's highest role is above or equal to mine.",
+    };
+  }
+
+  try {
+    await target.kick(reason);
+
+    return {
+      ok: true,
+      message: `👢 Kicked **${target.user.tag}**.\nReason: ${reason}`,
+    };
+  } catch (error) {
+    console.error(error);
+
+    return {
+      ok: false,
+      message: "Discord rejected the kick. Check my hierarchy and permissions.",
+    };
+  }
+}
+
+// =========================
+// ANNOUNCEMENT
+// =========================
 
 async function generateAnnouncement(text) {
   try {
-    const result = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: `
-Rewrite this into a clean Discord server announcement.
+    return await generateAI(
+      `
+Turn the following into a clean Discord announcement.
 
-Rules:
-- Keep the original meaning.
-- Do not invent information.
-- Make it easy to read.
-- Use a suitable heading.
-- Keep it concise.
-- You may use a few emojis.
-- Do not add @everyone or @here.
-- Do not add fake dates, times, rewards, or information.
+Keep the original meaning.
+Do not invent information.
+Make it readable and energetic.
+Use emojis when appropriate.
+Do not use @everyone or @here unless the original instruction explicitly requests it.
 
-ANNOUNCEMENT:
-${clip(text, 3000)}
+Message:
+${text}
 `,
-      config: {
+      {
         temperature: 0.5,
-        maxOutputTokens: 180,
-      },
-    });
-
-    const output =
-      result?.text ||
-      result?.response?.text?.() ||
-      "";
-
-    return clip(
-      output.trim() || `📢 **ANNOUNCEMENT**\n\n${text}`,
-      1900
+        maxOutputTokens: 400,
+      }
     );
-  } catch (error) {
-    console.error(
-      "Announcement formatter error:",
-      error
-    );
-
+  } catch {
     return `📢 **ANNOUNCEMENT**\n\n${text}`;
   }
 }
 
-// =====================================================
+async function sendAnnouncement(
+  guild,
+  channel,
+  text,
+  executor,
+  mentionEveryone = false
+) {
+  if (!isAuthorizedStaff(executor)) {
+    return "You aren't authorized to send staff announcements.";
+  }
+
+  if (!channel?.isTextBased()) {
+    return "That isn't a text channel.";
+  }
+
+  const me = guild.members.me;
+
+  if (
+    !me ||
+    !channel
+      .permissionsFor(me)
+      ?.has(PermissionFlagsBits.SendMessages)
+  ) {
+    return "I don't have permission to send messages there.";
+  }
+
+  const announcement =
+    await generateAnnouncement(text);
+
+  const allowedMentions = mentionEveryone
+    ? {
+        parse: ["everyone"],
+      }
+    : {
+        parse: [],
+      };
+
+  await channel.send({
+    content: announcement,
+    allowedMentions,
+  });
+
+  saveMemory(
+    guild.id,
+    "announcement",
+    `[${channel.name}] ${text}`,
+    executor.id
+  );
+
+  return `📢 Announcement posted in ${channel}.`;
+}
+
+// =========================
+// NATURAL STAFF COMMANDS
+// =========================
+
+async function handleStaffInstruction(
+  message,
+  instruction
+) {
+  const guild = message.guild;
+  const member = message.member;
+
+  if (!isAuthorizedStaff(member)) {
+    await message.reply(
+      "You can chat with me, but you aren't authorized to give me staff commands."
+    );
+    return;
+  }
+
+  const text = instruction.trim();
+
+  // -------------------------
+  // ANNOUNCEMENT
+  // -------------------------
+
+  const announcementWords =
+    /\b(announce|announcement|post this|send this|publish)\b/i;
+
+  if (announcementWords.test(text)) {
+    const channelMatch =
+      text.match(/<#(\d+)>/);
+
+    if (!channelMatch) {
+      await message.reply(
+        "Sure — mention the channel you want me to post it in."
+      );
+      return;
+    }
+
+    const channel =
+      guild.channels.cache.get(
+        channelMatch[1]
+      );
+
+    if (!channel) {
+      await message.reply(
+        "I couldn't find that channel."
+      );
+      return;
+    }
+
+    let announcementText =
+      text
+        .replace(/<#\d+>/g, "")
+        .replace(
+          /\b(announce|announcement|post this|send this|publish)\b/gi,
+          ""
+        )
+        .trim();
+
+    announcementText =
+      announcementText
+        .replace(
+          /^(this|that|saying|say|message)\s*[:,-]?\s*/i,
+          ""
+        )
+        .trim();
+
+    if (!announcementText) {
+      await message.reply(
+        "What do you want the announcement to say?"
+      );
+      return;
+    }
+
+    const wantsEveryone =
+      /@everyone|everyone/i.test(text);
+
+    const result =
+      await sendAnnouncement(
+        guild,
+        channel,
+        announcementText,
+        member,
+        wantsEveryone
+      );
+
+    await message.reply(result);
+    return;
+  }
+
+  // -------------------------
+  // WARN
+  // -------------------------
+
+  const warnMatch =
+    text.match(
+      /\b(warn|warning|verbal warn|verbally warn)\b[\s\S]*?<@!?(\d+)>/i
+    );
+
+  if (warnMatch) {
+    const userId = warnMatch[2];
+
+    const target =
+      await guild.members
+        .fetch(userId)
+        .catch(() => null);
+
+    if (!target) {
+      await message.reply(
+        "I couldn't find that member."
+      );
+      return;
+    }
+
+    let reason =
+      text
+        .replace(
+          /\b(warn|warning|verbal warn|verbally warn)\b/gi,
+          ""
+        )
+        .replace(
+          /<@!?\d+>/g,
+          ""
+        )
+        .replace(
+          /^(because|for|reason)\s*/i,
+          ""
+        )
+        .trim();
+
+    if (!reason) {
+      reason = "Staff-issued verbal warning.";
+    }
+
+    addWarning(
+      guild.id,
+      target.id,
+      member.id,
+      reason
+    );
+
+    await message.channel.send(
+      `⚠️ **Verbal Warning**\n${target} has been verbally warned.\n**Reason:** ${reason}`
+    );
+
+    return;
+  }
+
+  // -------------------------
+  // KICK
+  // -------------------------
+
+  const kickMatch =
+    text.match(
+      /\b(kick|remove)\b[\s\S]*?<@!?(\d+)>/i
+    );
+
+  if (kickMatch) {
+    const target =
+      await guild.members
+        .fetch(kickMatch[2])
+        .catch(() => null);
+
+    const reason =
+      text
+        .replace(
+          /\b(kick|remove)\b/gi,
+          ""
+        )
+        .replace(
+          /<@!?\d+>/g,
+          ""
+        )
+        .trim() ||
+      "Staff action.";
+
+    const result =
+      await kickMember(
+        guild,
+        target,
+        member,
+        reason
+      );
+
+    await message.reply(
+      result.message
+    );
+
+    return;
+  }
+
+  // -------------------------
+  // ROLE RENAME
+  // -------------------------
+
+  const renameMatch =
+    text.match(
+      /\b(rename|change the name of)\b[\s\S]*?<@&(\d+)>[\s\S]*?\bto\b\s+(.+)/i
+    );
+
+  if (renameMatch) {
+    const role =
+      guild.roles.cache.get(
+        renameMatch[2]
+      );
+
+    const newName =
+      renameMatch[3]
+        .trim()
+        .replace(/^["']|["']$/g, "");
+
+    if (!role) {
+      await message.reply(
+        "I couldn't find that role."
+      );
+      return;
+    }
+
+    const result =
+      await renameRole(
+        guild,
+        role,
+        newName,
+        member
+      );
+
+    await message.reply(
+      result.message
+    );
+
+    return;
+  }
+
+  // -------------------------
+  // MEMBER INFO
+  // -------------------------
+
+  const mentionedUser =
+    message.mentions.members.first();
+
+  if (
+    mentionedUser &&
+    /\b(profile|information|info|about|details|join date|stats)\b/i.test(text)
+  ) {
+    await message.reply(
+      getMemberInformation(
+        mentionedUser
+      )
+    );
+
+    return;
+  }
+
+  // -------------------------
+  // FALLBACK AI
+  // -------------------------
+
+  const answer =
+    await answerUser(
+      guild,
+      member,
+      text
+    );
+
+  await message.reply(
+    answer || "I'm not sure what you want me to do."
+  );
+}
+
+// =========================
+// TICKET ASSISTANT
+// =========================
+
+function looksLikeTicket(channel) {
+  if (!channel) return false;
+
+  const channelName =
+    channel.name?.toLowerCase() || "";
+
+  const parentName =
+    channel.parent?.name?.toLowerCase() || "";
+
+  return (
+    channelName.includes("ticket") ||
+    parentName.includes("ticket") ||
+       parentName.includes("support")
+  );
+}
+
+async function handleTicketCreated(channel) {
+  if (!looksLikeTicket(channel)) return;
+
+  await new Promise((resolve) =>
+    setTimeout(resolve, 1500)
+  );
+
+  try {
+    const messages =
+      await channel.messages.fetch({
+        limit: 10,
+      });
+
+    const recent = [...messages.values()]
+      .reverse()
+      .filter((m) => !m.author.bot)
+      .map(
+        (m) =>
+          `${m.author.tag}: ${clip(m.content, 1000)}`
+      )
+      .join("\n");
+
+    const summary = recent
+      ? await generateAI(
+          `
+You are assisting staff inside a Discord support ticket.
+
+Summarize the user's issue in 2-4 short bullet points.
+Do not make decisions for staff.
+
+Ticket messages:
+${recent}
+`,
+          {
+            temperature: 0.2,
+            maxOutputTokens: 250,
+          }
+        )
+      : "No issue has been described yet.";
+
+    await channel.send(
+      `🎫 **Underdog AI Ticket Assistant**
+
+Hey! I'm here to help with this ticket.
+
+**Current summary:**
+${summary}
+
+Please explain what you need help with, and I'll help staff understand the issue.`
+    );
+  } catch (error) {
+    console.error(
+      "Ticket assistant error:",
+      error
+    );
+  }
+}
+
+// =========================
 // SLASH COMMANDS
-// =====================================================
+// =========================
 
 const commands = [
   new SlashCommandBuilder()
     .setName("ask")
-    .setDescription("Ask Underdog AI something")
+    .setDescription("Ask Underdog AI")
     .addStringOption((option) =>
       option
         .setName("question")
@@ -790,121 +1134,53 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("forget")
-    .setDescription("Forget a memory")
-    .addStringOption((option) =>
+    .setDescription("Forget a stored memory")
+    .addIntegerOption((option) =>
       option
-        .setName("search")
-        .setDescription("Memory to remove")
+        .setName("id")
+        .setDescription("Memory ID")
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName("memories")
-    .setDescription("View saved memories"),
+    .setDescription("View stored server memories"),
 
   new SlashCommandBuilder()
     .setName("setchannel")
-    .setDescription("Set the automatic AI memory channel")
+    .setDescription("Set the automatic AI/memory channel")
     .addChannelOption((option) =>
       option
         .setName("channel")
-        .setDescription("Channel to monitor")
+        .setDescription("Channel")
         .addChannelTypes(ChannelType.GuildText)
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName("personality")
-    .setDescription("Change Underdog AI's personality")
+    .setDescription("Change Underdog AI personality")
     .addStringOption((option) =>
       option
-        .setName("style")
+        .setName("personality")
         .setDescription("New personality")
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
-    .setName("task")
-    .setDescription("Manage Underdog tasks")
-    .addSubcommand((sub) =>
-      sub
-        .setName("create")
-        .setDescription("Create a task")
-        .addStringOption((option) =>
-          option
-            .setName("task")
-            .setDescription("Task")
-            .setRequired(true)
-        )
-        .addStringOption((option) =>
-          option
-            .setName("due")
-            .setDescription(
-              "Optional ISO date, e.g. 2026-09-20T18:00:00+08:00"
-            )
-            .setRequired(false)
-        )
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName("list")
-        .setDescription("List active tasks")
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName("complete")
-        .setDescription("Complete a task")
-        .addIntegerOption((option) =>
-          option
-            .setName("id")
-            .setDescription("Task ID")
-            .setRequired(true)
-        )
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName("delete")
-        .setDescription("Delete a task")
-        .addIntegerOption((option) =>
-          option
-            .setName("id")
-            .setDescription("Task ID")
-            .setRequired(true)
-        )
-    ),
-
-  new SlashCommandBuilder()
     .setName("indexchannel")
-    .setDescription("Index important information from a channel")
+    .setDescription("Index a channel")
     .addChannelOption((option) =>
       option
         .setName("channel")
         .setDescription("Channel to index")
         .addChannelTypes(ChannelType.GuildText)
         .setRequired(true)
-    )
-    .addIntegerOption((option) =>
-      option
-        .setName("messages")
-        .setDescription("Number of messages to scan")
-        .setMinValue(10)
-        .setMaxValue(1000)
-        .setRequired(false)
     ),
 
   new SlashCommandBuilder()
     .setName("indexserver")
-    .setDescription("Index important information across the server")
-    .addIntegerOption((option) =>
-      option
-        .setName("messages")
-        .setDescription(
-          "Messages to scan per channel"
-        )
-        .setMinValue(10)
-        .setMaxValue(1000)
-        .setRequired(false)
-    ),
+    .setDescription("Index server channels"),
 
   new SlashCommandBuilder()
     .setName("announce")
@@ -912,7 +1188,7 @@ const commands = [
     .addChannelOption((option) =>
       option
         .setName("channel")
-        .setDescription("Channel to announce in")
+        .setDescription("Channel")
         .addChannelTypes(ChannelType.GuildText)
         .setRequired(true)
     )
@@ -922,717 +1198,624 @@ const commands = [
         .setDescription("Announcement")
         .setRequired(true)
     ),
+
+  new SlashCommandBuilder()
+    .setName("warnings")
+    .setDescription("View a member's warnings")
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("Member")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("memberinfo")
+    .setDescription("View server member information")
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("Member")
+        .setRequired(true)
+    ),
 ].map((command) => command.toJSON());
 
-// =====================================================
+// =========================
 // REGISTER COMMANDS
-// =====================================================
+// =========================
 
 async function registerCommands() {
+  const { REST } = require("@discordjs/rest");
+  const { Routes } = require("discord-api-types/v10");
+
+  const rest = new REST({
+    version: "10",
+  }).setToken(DISCORD_TOKEN);
+
+  await rest.put(
+    Routes.applicationGuildCommands(
+      DISCORD_CLIENT_ID,
+      DISCORD_GUILD_ID
+    ),
+    {
+      body: commands,
+    }
+  );
+
+  console.log("Slash commands registered.");
+}
+
+// =========================
+// READY
+// =========================
+
+client.once("ready", async () => {
+  console.log(
+    `🥊 ${client.user.tag} is online.`
+  );
+
   try {
-    const guild =
-      await client.guilds.fetch(DISCORD_GUILD_ID);
-
-    await guild.commands.set(commands);
-
-    console.log(
-      `Registered ${commands.length} slash commands.`
-    );
+    await registerCommands();
   } catch (error) {
     console.error(
       "Command registration error:",
       error
     );
   }
-}
 
-// =====================================================
-// READY
-// =====================================================
+  // Task reminder loop
+  setInterval(async () => {
+    const now = Date.now();
 
-client.once("ready", async () => {
-  console.log(
-    `Underdog AI online as ${client.user.tag}`
-  );
+    const dueTasks = db.prepare(`
+      SELECT *
+      FROM tasks
+      WHERE completed = 0
+        AND due_at IS NOT NULL
+        AND due_at <= ?
+    `).all(now);
 
-  console.log(
-    `Gemini model: ${GEMINI_MODEL}`
-  );
+    for (const task of dueTasks) {
+      try {
+        const guild =
+          client.guilds.cache.get(
+            task.guild_id
+          );
 
-  await registerCommands();
+        if (!guild) continue;
+
+        const channelId =
+          getSetting(
+            task.guild_id,
+            "ai_channel"
+          );
+
+        if (!channelId) continue;
+
+        const channel =
+          guild.channels.cache.get(
+            channelId
+          );
+
+        if (!channel) continue;
+
+        await channel.send(
+          `⏰ **Task Reminder**\n${task.task}`
+        );
+
+        db.prepare(`
+          UPDATE tasks
+          SET completed = 1
+          WHERE id = ?
+        `).run(task.id);
+      } catch (error) {
+        console.error(
+          "Task reminder error:",
+          error
+        );
+      }
+    }
+  }, 30000);
 });
 
-// =====================================================
+// =========================
 // INTERACTIONS
-// =====================================================
+// =========================
 
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  try {
-    // =================================================
-    // /ASK
-    // =================================================
-
-    if (interaction.commandName === "ask") {
-      const question =
-        interaction.options.getString("question");
-
-      await interaction.deferReply();
-
-      const memories =
-        searchMemories(question);
-
-      const answer =
-        await generateAnswer({
-          userMessage: question,
-          memoryContext:
-            formatMemories(memories),
-        });
-
-      await interaction.editReply(answer);
+client.on(
+  "interactionCreate",
+  async (interaction) => {
+    if (!interaction.isChatInputCommand()) {
       return;
     }
 
-    // =================================================
-    // STAFF-ONLY COMMAND CHECK
-    // =================================================
+    const {
+      commandName,
+      guild,
+      member,
+    } = interaction;
+
+    if (!guild) return;
+
+    const staffCommands = new Set([
+      "remember",
+      "forget",
+      "setchannel",
+      "personality",
+      "indexchannel",
+      "indexserver",
+      "announce",
+      "warnings",
+    ]);
 
     if (
-      [
-        "remember",
-        "forget",
-        "setchannel",
-        "personality",
-        "task",
-        "indexchannel",
-        "indexserver",
-        "announce",
-      ].includes(interaction.commandName)
+      staffCommands.has(commandName) &&
+      !isAuthorizedStaff(member)
     ) {
-      if (!isAuthorizedStaff(interaction.member)) {
+      await interaction.reply({
+        content:
+          "You don't have permission to use this command.",
+        ephemeral: true,
+      });
+
+      return;
+    }
+
+    try {
+      // ASK
+      if (commandName === "ask") {
+        const question =
+          interaction.options.getString(
+            "question"
+          );
+
+        await interaction.deferReply();
+
+        const answer =
+          await answerUser(
+            guild,
+            member,
+            question
+          );
+
+        await interaction.editReply(
+          answer || "I don't know."
+        );
+
+        return;
+      }
+
+      // REMEMBER
+      if (commandName === "remember") {
+        const information =
+          interaction.options.getString(
+            "information"
+          );
+
+        saveMemory(
+          guild.id,
+          "manual",
+          information,
+          member.id
+        );
+
+        await interaction.reply(
+          "🧠 Got it. I'll remember that."
+        );
+
+        return;
+      }
+
+      // FORGET
+      if (commandName === "forget") {
+        const id =
+          interaction.options.getInteger(
+            "id"
+          );
+
+        const result =
+          deleteMemory(
+            guild.id,
+            id
+          );
+
+        await interaction.reply(
+          result.changes
+            ? `🗑️ Forgot memory #${id}.`
+            : `I couldn't find memory #${id}.`
+        );
+
+        return;
+      }
+
+      // MEMORIES
+      if (commandName === "memories") {
+        const rows =
+          db.prepare(`
+            SELECT *
+            FROM memories
+            WHERE guild_id = ?
+            ORDER BY created_at DESC
+            LIMIT 20
+          `).all(guild.id);
+
         await interaction.reply({
           content:
-            "This command is restricted to Admin and Head Admin. 💀",
+            rows.length
+              ? formatMemories(rows)
+              : "No memories stored yet.",
           ephemeral: true,
         });
 
         return;
       }
-    }
 
-    // =================================================
-    // /REMEMBER
-    // =================================================
-
-    if (interaction.commandName === "remember") {
-      const information =
-        interaction.options.getString("information");
-
-      saveMemory(
-        "manual",
-        information,
-        interaction.user.id,
-        interaction.user.username
-      );
-
-      await interaction.reply(
-        "Saved. My brain got another upgrade. 🧠"
-      );
-
-      return;
-    }
-
-    // =================================================
-    // /FORGET
-    // =================================================
-
-    if (interaction.commandName === "forget") {
-      const search =
-        interaction.options.getString("search");
-
-      const rows =
-        searchMemories(search, 1);
-
-      if (!rows.length) {
-        await interaction.reply(
-          "Couldn't find that memory. 💀"
-        );
-
-        return;
-      }
-
-      db.prepare(
-        "DELETE FROM memories WHERE id = ?"
-      ).run(rows[0].id);
-
-      await interaction.reply(
-        "Gone. Like your winning streak. 💀"
-      );
-
-      return;
-    }
-
-    // =================================================
-    // /MEMORIES
-    // =================================================
-
-    if (interaction.commandName === "memories") {
-      const rows = db
-        .prepare(`
-          SELECT *
-          FROM memories
-          ORDER BY created_at DESC
-          LIMIT 25
-        `)
-        .all();
-
-      if (!rows.length) {
-        await interaction.reply(
-          "Memory vault is empty. 🧠"
-        );
-
-        return;
-      }
-
-      const output = rows
-        .map(
-          (row, i) =>
-            `**${i + 1}. [${row.category}]** ${clip(
-              row.content,
-              250
-            )}`
-        )
-        .join("\n\n");
-
-      await interaction.reply(
-        clip(
-          `🧠 **UNDERDOG MEMORY VAULT**\n\n${output}`,
-          1900
-        )
-      );
-
-      return;
-    }
-
-    // =================================================
-    // /SETCHANNEL
-    // =================================================
-
-    if (interaction.commandName === "setchannel") {
-      const channel =
-        interaction.options.getChannel("channel");
-
-      setSetting(
-        "aiChannel",
-        channel.id
-      );
-
-      await interaction.reply(
-        `AI monitoring channel set to ${channel}.`
-      );
-
-      return;
-    }
-
-    // =================================================
-    // /PERSONALITY
-    // =================================================
-
-    if (interaction.commandName === "personality") {
-      const style =
-        interaction.options.getString("style");
-
-      setSetting(
-        "personality",
-        style
-      );
-
-      await interaction.reply(
-        "Personality updated. 💀"
-      );
-
-      return;
-    }
-
-    // =================================================
-    // /TASK
-    // =================================================
-
-    if (interaction.commandName === "task") {
-      const subcommand =
-        interaction.options.getSubcommand();
-
-      // -----------------------------------------------
-      // CREATE
-      // -----------------------------------------------
-
-      if (subcommand === "create") {
-        const task =
-          interaction.options.getString("task");
-
-        const due =
-          interaction.options.getString("due");
-
-        let dueAt = null;
-
-        if (due) {
-          const parsed =
-            new Date(due).getTime();
-
-          if (Number.isNaN(parsed)) {
-            await interaction.reply(
-              "That due date isn't valid. Use an ISO date like `2026-09-20T18:00:00+08:00`."
-            );
-
-            return;
-          }
-
-          dueAt = parsed;
-        }
-
-        const id = createTask(
-          task,
-          interaction.user.id,
-          interaction.channelId,
-          dueAt
-        );
-
-        await interaction.reply(
-          `Task **#${id}** created. Now actually do it. 😭`
-        );
-
-        return;
-      }
-
-      // -----------------------------------------------
-      // LIST
-      // -----------------------------------------------
-
-      if (subcommand === "list") {
-        const tasks =
-          getActiveTasks();
-
-        if (!tasks.length) {
-          await interaction.reply(
-            "No active tasks. We're either productive or completely cooked. 💀"
+      // SET CHANNEL
+      if (commandName === "setchannel") {
+        const channel =
+          interaction.options.getChannel(
+            "channel"
           );
 
-          return;
-        }
-
-        const output = tasks
-          .map((task) => {
-            const due = task.due_at
-              ? ` — <t:${Math.floor(
-                  task.due_at / 1000
-                )}:R>`
-              : "";
-
-            return `**#${task.id}** ${task.task}${due}`;
-          })
-          .join("\n");
+        setSetting(
+          guild.id,
+          "ai_channel",
+          channel.id
+        );
 
         await interaction.reply(
-          clip(
-            `📝 **ACTIVE TASKS**\n\n${output}`,
-            1900
-          )
+          `⚙️ AI/memory channel set to ${channel}.`
         );
 
         return;
       }
 
-      // -----------------------------------------------
-      // COMPLETE
-      // -----------------------------------------------
-
-      if (subcommand === "complete") {
-        const id =
-          interaction.options.getInteger("id");
-
-        const result =
-          completeTask(id);
-
-        if (!result.changes) {
-          await interaction.reply(
-            "That task doesn't exist. 💀"
+      // PERSONALITY
+      if (commandName === "personality") {
+        const personality =
+          interaction.options.getString(
+            "personality"
           );
 
-          return;
-        }
+        setSetting(
+          guild.id,
+          "personality",
+          personality
+        );
 
         await interaction.reply(
-          `Task **#${id}** completed. 🥊`
+          "🎭 Personality updated."
         );
 
         return;
       }
 
-      // -----------------------------------------------
-      // DELETE
-      // -----------------------------------------------
-
-      if (subcommand === "delete") {
-        const id =
-          interaction.options.getInteger("id");
-
-        const result =
-          deleteTask(id);
-
-        if (!result.changes) {
-          await interaction.reply(
-            "That task doesn't exist. 💀"
+      // INDEX CHANNEL
+      if (commandName === "indexchannel") {
+        const channel =
+          interaction.options.getChannel(
+            "channel"
           );
 
-          return;
-        }
+        await interaction.deferReply();
 
-        await interaction.reply(
-          `Task **#${id}** deleted.`
+        const count =
+          await indexChannel(
+            channel,
+            100
+          );
+
+        await interaction.editReply(
+          `📚 Indexed ${count} messages from ${channel}.`
         );
 
         return;
       }
-    }
 
-    // =================================================
-    // /INDEXCHANNEL
-    // =================================================
+      // INDEX SERVER
+      if (commandName === "indexserver") {
+        await interaction.deferReply();
 
-    if (interaction.commandName === "indexchannel") {
-      const channel =
-        interaction.options.getChannel("channel");
+        let total = 0;
 
-      const amount =
-        interaction.options.getInteger("messages") || 100;
+        const channels =
+          guild.channels.cache.filter(
+            (channel) =>
+              channel.type ===
+              ChannelType.GuildText
+          );
 
-      await interaction.deferReply();
-
-      const count =
-        await indexChannel(
-          channel,
-          amount
-        );
-
-      await interaction.editReply(
-        `📚 Indexed **${count}** messages from ${channel}.\n\nI only saved information I considered important.`
-      );
-
-      return;
-    }
-
-    // =================================================
-    // /INDEXSERVER
-    // =================================================
-
-    if (interaction.commandName === "indexserver") {
-      const amount =
-        interaction.options.getInteger("messages") || 100;
-
-      await interaction.deferReply();
-
-      let total = 0;
-      let channelsScanned = 0;
-
-      const guild =
-        interaction.guild;
-
-      const channels =
-        guild.channels.cache.filter(
-          (channel) =>
-            channel.type === ChannelType.GuildText &&
-            channel.viewable
-        );
-
-      for (const channel of channels.values()) {
-        try {
-          const count =
-            await indexChannel(
+        for (const channel of channels.values()) {
+          try {
+            total += await indexChannel(
               channel,
-              amount
+              50
             );
-
-          total += count;
-          channelsScanned++;
-
-          await new Promise((resolve) =>
-            setTimeout(resolve, 500)
-          );
-        } catch (error) {
-          console.error(
-            `Index error in ${channel.name}:`,
-            error
-          );
+          } catch (error) {
+            console.error(
+              `Failed indexing #${channel.name}:`,
+              error
+            );
+          }
         }
-      }
 
-      await interaction.editReply(
-        `🌐 **Server indexing complete.**\n\nChannels scanned: **${channelsScanned}**\nMessages processed: **${total}**`
-      );
-
-      return;
-    }
-
-    // =================================================
-    // /ANNOUNCE
-    // =================================================
-
-    if (interaction.commandName === "announce") {
-      const channel =
-        interaction.options.getChannel("channel");
-
-      const message =
-        interaction.options.getString("message");
-
-      if (!channel.isTextBased()) {
-        await interaction.reply(
-          "That isn't a text channel."
+        await interaction.editReply(
+          `🌐 Server indexing complete. Indexed ${total} messages.`
         );
 
         return;
       }
 
-      const botMember =
-        interaction.guild.members.me;
+      // ANNOUNCE
+      if (commandName === "announce") {
+        const channel =
+          interaction.options.getChannel(
+            "channel"
+          );
 
-      const permissions =
-        channel.permissionsFor(botMember);
+        const message =
+          interaction.options.getString(
+            "message"
+          );
 
-      if (
-        !permissions?.has(
-          PermissionFlagsBits.ViewChannel
-        ) ||
-        !permissions?.has(
-          PermissionFlagsBits.SendMessages
-        )
-      ) {
-        await interaction.reply(
-          `I don't have permission to send messages in ${channel}.`
+        await interaction.deferReply();
+
+        const result =
+          await sendAnnouncement(
+            guild,
+            channel,
+            message,
+            member,
+            false
+          );
+
+        await interaction.editReply(
+          result
         );
 
         return;
       }
 
-      const announcement =
-        await generateAnnouncement(message);
+      // WARNINGS
+      if (commandName === "warnings") {
+        const user =
+          interaction.options.getUser(
+            "user"
+          );
 
-      await channel.send({
-        content: announcement,
-        allowedMentions: {
-          parse: [],
-        },
-      });
+        const warnings =
+          getWarnings(
+            guild.id,
+            user.id
+          );
 
-      saveMemory(
-        "announcement",
-        message,
-        interaction.user.id,
-        interaction.user.username
-      );
+        if (!warnings.length) {
+          await interaction.reply(
+            `✅ ${user.tag} has no recorded warnings.`
+          );
 
-      await interaction.reply(
-        `Announcement posted in ${channel}. 📢`
-      );
+          return;
+        }
 
-      return;
-    }
-  } catch (error) {
-    console.error(
-      "Interaction error:",
-      error
-    );
+        const output =
+          warnings
+            .slice(0, 15)
+            .map(
+              (warning, index) =>
+                `**${index + 1}.** ${warning.reason} — <t:${Math.floor(
+                  warning.created_at / 1000
+                )}:R>`
+            )
+            .join("\n");
 
-    if (
-      interaction.replied ||
-      interaction.deferred
-    ) {
-      await interaction.editReply(
-        "Something broke on my end. 💀"
-      );
-    } else {
-      await interaction.reply({
-        content:
-          "Something broke on my end. 💀",
-        ephemeral: true,
-      });
-    }
-  }
-});
+        await interaction.reply({
+          content:
+            `⚠️ **Warnings for ${user.tag}**\n\n${output}`,
+          ephemeral: true,
+        });
 
-// =====================================================
-// MESSAGE HANDLER
-// =====================================================
+        return;
+      }
 
-client.on("messageCreate", async (message) => {
-  if (!message.guild) return;
-  if (message.author.bot) return;
+      // MEMBER INFO
+      if (commandName === "memberinfo") {
+        const user =
+          interaction.options.getUser(
+            "user"
+          );
 
-  const aiChannel =
-    getSetting("aiChannel");
+        const target =
+          await guild.members
+            .fetch(user.id)
+            .catch(() => null);
 
-  // =================================================
-  // AUTOMATIC MEMORY
-  // =================================================
-
-  if (
-    aiChannel &&
-    message.channel.id === aiChannel &&
-    message.content.trim()
-  ) {
-    try {
-      const classification =
-        await classifyForMemory(
-          message.content
+        await interaction.reply(
+          getMemberInformation(target)
         );
 
-      if (classification) {
-        saveMemory(
-          classification.category,
-          message.content,
-          message.author.id,
-          message.author.username
-        );
+        return;
       }
     } catch (error) {
       console.error(
-        "Automatic memory error:",
+        "Interaction error:",
         error
       );
+
+      const response =
+        "Something went wrong while processing that.";
+
+      if (interaction.deferred) {
+        await interaction.editReply(
+          response
+        ).catch(() => {});
+      } else if (!interaction.replied) {
+        await interaction.reply({
+          content: response,
+          ephemeral: true,
+        }).catch(() => {});
+      }
     }
   }
+);
 
-  // =================================================
-  // BOT MENTION
-  // =================================================
+// =========================
+// NEW CHANNEL / TICKET
+// =========================
 
-  const mentioned =
-    message.mentions.users.has(
-      client.user.id
-    );
-
-  // =================================================
-  // DIRECT REPLY TO BOT
-  // =================================================
-
-  let repliedToBot = false;
-
-  if (message.reference?.messageId) {
-    try {
-      const referenced =
-        await message.channel.messages.fetch(
-          message.reference.messageId
-        );
-
-      repliedToBot =
-        referenced.author.id ===
-        client.user.id;
-    } catch {
-      repliedToBot = false;
-    }
-  }
-
-  if (!mentioned && !repliedToBot) {
-    return;
-  }
-
-  // =================================================
-  // REMOVE BOT MENTION
-  // =================================================
-
-  let content =
-    message.content;
-
-  const mentionRegex =
-    new RegExp(
-      `<@!?${client.user.id}>`,
-      "g"
-    );
-
-  content = content
-    .replace(mentionRegex, "")
-    .trim();
-
-  if (!content) {
-    await message.reply(
-      randomItem([
-        "What do you want, champ? 💀",
-        "You called?",
-        "I'm listening. Make it quick. 🥊",
-        "Bro summoned me just to say nothing. 😭",
-      ])
-    );
-
-    return;
-  }
-
-  // =================================================
-  // STAFF-DIRECTED INSTRUCTION
-  // =================================================
-
-  if (
-    mentioned &&
-    isAuthorizedStaff(message.member)
-  ) {
-    const handled =
-      await handleStaffInstruction(
-        message,
-        content
-      );
-
-    if (handled) {
+client.on(
+  "channelCreate",
+  async (channel) => {
+    if (
+      channel.type !==
+      ChannelType.GuildText
+    ) {
       return;
     }
+
+    await handleTicketCreated(
+      channel
+    );
   }
+);
 
-  // =================================================
-  // NORMAL AI CHAT
-  // =================================================
+// =========================
+// MESSAGE HANDLER
+// =========================
 
-  try {
-    await message.channel.sendTyping();
+client.on(
+  "messageCreate",
+  async (message) => {
+    if (
+      message.author.bot ||
+      !message.guild
+    ) {
+      return;
+    }
 
-    const memories =
-      searchMemories(content);
+    const guild =
+      message.guild;
 
-    const staffContext =
-      isAuthorizedStaff(
-        message.member
-      )
-        ? "The user is an authorized Admin or Head Admin."
-        : "";
+    // AUTOMATIC MEMORY CHANNEL
+    const aiChannel =
+      getSetting(
+        guild.id,
+        "ai_channel"
+      );
 
-    const answer =
-      await generateAnswer({
-        userMessage: content,
-        memoryContext:
-          formatMemories(memories),
-        staffContext,
-      });
+    if (
+      aiChannel === message.channel.id &&
+      message.content.length > 10
+    ) {
+      try {
+        const result =
+          await classifyForMemory(
+            message.content
+          );
 
-    await message.reply(answer);
-  } catch (error) {
+        if (result.save) {
+          saveMemory(
+            guild.id,
+            result.category,
+            `[${message.channel.name}] ${message.content}`,
+            message.author.id
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Automatic memory error:",
+          error
+        );
+      }
+    }
+
+    // BOT MENTION / REPLY
+    const mentioned =
+      message.mentions.users.has(
+        client.user.id
+      );
+
+    const isReplyToBot =
+      message.reference?.messageId
+        ? await message.channel.messages
+            .fetch(
+              message.reference.messageId
+            )
+            .then(
+              (msg) =>
+                msg.author.id ===
+                client.user.id
+            )
+            .catch(() => false)
+        : false;
+
+    if (!mentioned && !isReplyToBot) {
+      return;
+    }
+
+    const instruction =
+      cleanBotMention(
+        message.content
+      );
+
+    if (!instruction) {
+      await message.reply(
+        "Yo? 😭 What do you need?"
+      );
+      return;
+    }
+
+    try {
+      if (
+        isAuthorizedStaff(
+          message.member
+        )
+      ) {
+        await handleStaffInstruction(
+          message,
+          instruction
+        );
+
+        return;
+      }
+
+      await message.channel.sendTyping();
+
+      const answer =
+        await answerUser(
+          guild,
+          message.member,
+          instruction
+        );
+
+      await message.reply(
+        answer || "I don't know that one."
+      );
+    } catch (error) {
+      console.error(
+        "Message AI error:",
+        error
+      );
+
+      await message.reply(
+        "My brain just fumbled that one 😭 Try again."
+      );
+    }
+  }
+);
+
+// =========================
+// ERRORS
+// =========================
+
+client.on(
+  "error",
+  (error) => {
     console.error(
-      "Message AI error:",
+      "Discord client error:",
       error
     );
-
-    await message.reply(
-      "My brain just got countered. Try again. 💀"
-    );
   }
-});
-
-// =====================================================
-// ERRORS
-// =====================================================
-
-client.on("error", (error) => {
-  console.error(
-    "Discord client error:",
-    error
-  );
-});
+);
 
 process.on(
   "unhandledRejection",
@@ -1644,8 +1827,8 @@ process.on(
   }
 );
 
-// =====================================================
+// =========================
 // LOGIN
-// =====================================================
+// =========================
 
-client.login(DISCORD_TOKEN);
+client.login(DISCORD_TOKEN); 
