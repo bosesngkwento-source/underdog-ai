@@ -857,17 +857,7 @@ process.on(
 
 client.login(
   process.env.DISCORD_TOKEN
-);information TEXT NOT NULL,
-category TEXT NOT NULL,
-date TEXT NOT NULL,
-channel TEXT,
-author TEXT,
-importance INTEGER NOT NULL DEFAULT 3
 );
-
-CREATE TABLE IF NOT EXISTS settings (
-key TEXT PRIMARY KEY,
-value TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
@@ -1702,6 +1692,14 @@ client.on("messageCreate", async message => {
 client.on("error", error => console.error("Discord client error:", error.message));
 process.on("unhandledRejection", error =>
   console.error("Unhandled rejection:", error?.message || error)
+);
+
+client.login(process.env.DISCORD_TOKEN);
+client.on("unhandledRejection", (error) =>
+  console.error(
+    "Unhandled rejection:",
+    error?.message || error
+  )
 );
 
 client.login(process.env.DISCORD_TOKEN);
