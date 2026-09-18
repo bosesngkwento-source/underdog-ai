@@ -36,8 +36,6 @@ const STAFF_ROLE_IDS = new Set([
   "1530288809932099634", // Head Admin
 ]);
 
-const BOT_PREFIX = "Underdog AI";
-
 // ======================================================
 // DISCORD CLIENT
 // ======================================================
@@ -45,7 +43,6 @@ const BOT_PREFIX = "Underdog AI";
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
@@ -53,7 +50,6 @@ const client = new Client({
   partials: [
     Partials.Channel,
     Partials.Message,
-    Partials.GuildMember,
   ],
 });
 
@@ -90,17 +86,6 @@ db.exec(`
     PRIMARY KEY (guild_id, key)
   );
 
-  CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id TEXT NOT NULL,
-    channel_id TEXT,
-    title TEXT NOT NULL,
-    due_at INTEGER,
-    created_by TEXT,
-    completed INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL
-  );
-
   CREATE TABLE IF NOT EXISTS indexed_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id TEXT NOT NULL,
@@ -130,7 +115,9 @@ function clip(text, max = 1800) {
 
   text = String(text);
 
-  if (text.length <= max) return text;
+  if (text.length <= max) {
+    return text;
+  }
 
   return text.slice(0, max - 3) + "...";
 }
@@ -150,7 +137,11 @@ function getSetting(guildId, key) {
 
 function setSetting(guildId, key, value) {
   db.prepare(`
-    INSERT INTO settings (guild_id, key, value)
+    INSERT INTO settings (
+      guild_id,
+      key,
+      value
+    )
     VALUES (?, ?, ?)
     ON CONFLICT(guild_id, key)
     DO UPDATE SET value = excluded.value
@@ -176,21 +167,9 @@ function isAuthorizedStaff(member) {
     return true;
   }
 
-  return member.roles?.cache?.some(role =>
-    STAFF_ROLE_IDS.has(role.id)
+  return member.roles?.cache?.some(
+    role => STAFF_ROLE_IDS.has(role.id)
   );
-}
-
-// ======================================================
-// BOT PERMISSION CHECK
-// ======================================================
-
-function hasBotPermission(guild, permission) {
-  const me = guild.members.me;
-
-  if (!me) return false;
-
-  return me.permissions.has(permission);
 }
 
 // ======================================================
@@ -241,7 +220,10 @@ function deleteMemory(guildId, id) {
     DELETE FROM memories
     WHERE guild_id = ?
     AND id = ?
-  `).run(guildId, id);
+  `).run(
+    guildId,
+    id
+  );
 }
 
 function searchMemories(
@@ -267,9 +249,9 @@ function searchMemories(
     .filter(Boolean);
 
   const scored = rows.map(row => {
-    const text = (
+    const text =
       `${row.category} ${row.content}`
-    ).toLowerCase();
+        .toLowerCase();
 
     let score = 0;
 
@@ -304,7 +286,7 @@ function formatMemories(rows) {
 }
 
 // ======================================================
-// GEMINI AI
+// GEMINI
 // ======================================================
 
 async function generateAI(
@@ -336,8 +318,10 @@ async function generateAI(
         },
       });
 
-    return response.text?.trim() ||
-      "I couldn't generate a response right now.";
+    return (
+      response.text?.trim() ||
+      "I couldn't generate a response right now."
+    );
   } catch (error) {
     console.error(
       "Gemini error:",
@@ -359,24 +343,30 @@ function getPersonality(guildId) {
       "personality"
     ) ||
     `
-You are Underdog AI, the friendly AI assistant for a boxing
-gaming Discord server.
+You are Underdog AI, the AI assistant for a boxing gaming Discord server.
 
 Personality:
 - Friendly
 - Energetic
 - Helpful
 - Boxing/gaming themed
-- Short and natural responses
+- Short and natural
 - Occasionally playful
 - Never overly formal
-- Do not pretend to know information you do not know
 
-You are an assistant, not the owner of the server.
+You are not the owner of the server.
 
-Respect staff instructions when they are authorized.
-Never invent server rules, rankings, records, announcements,
-events, or member information.
+Respect authorized staff instructions.
+
+Never invent:
+- Server rules
+- Rankings
+- Records
+- Events
+- Announcements
+- Member information
+
+If you do not know something, say that you do not know.
 `
   );
 }
@@ -386,12 +376,19 @@ events, or member information.
 // ======================================================
 
 async function answerUser(
-  message,
+  source,
   userPrompt
 ) {
+  const guild =
+    source.guild;
+
+  if (!guild) {
+    return "⚠️ I can only answer inside a server.";
+  }
+
   const memories =
     searchMemories(
-      message.guild.id,
+      guild.id,
       userPrompt,
       12
     );
@@ -399,32 +396,37 @@ async function answerUser(
   const memoryText =
     formatMemories(memories);
 
+  const displayName =
+    source.member?.displayName ||
+    source.user?.username ||
+    source.author?.username ||
+    "User";
+
   const prompt = `
-${getPersonality(message.guild.id)}
+${getPersonality(guild.id)}
 
 SERVER MEMORY:
 ${memoryText}
 
 CURRENT USER:
-${message.member?.displayName ||
-  message.author.username}
+${displayName}
 
 USER MESSAGE:
 ${userPrompt}
 
 Instructions:
 - Use server memory when relevant.
-- Do not invent missing information.
+- Do not invent information.
 - If the server memory does not contain something,
   clearly say you do not know.
-- Keep the response concise unless more detail is needed.
+- Keep responses concise.
 `;
 
   return generateAI(prompt);
 }
 
 // ======================================================
-// AUTOMATIC MEMORY CLASSIFICATION
+// AUTOMATIC MEMORY
 // ======================================================
 
 async function classifyForMemory(message) {
@@ -441,14 +443,12 @@ async function classifyForMemory(message) {
   }
 
   const prompt = `
-You are analyzing a Discord message for long-term server memory.
+Analyze this Discord message for important permanent server information.
 
-Message:
+MESSAGE:
 ${clip(content, 1500)}
 
-Decide whether this contains useful permanent server information.
-
-Useful examples:
+Save only useful information such as:
 - Rules
 - Announcements
 - Patch notes
@@ -464,14 +464,14 @@ Useful examples:
 - Important server information
 
 Do NOT save:
+- Greetings
 - Normal conversations
 - Jokes
-- Greetings
-- Temporary chatter
-- Random opinions
 - Spam
+- Random opinions
+- Temporary chatter
 
-Return EXACTLY one of:
+Return EXACTLY:
 
 SAVE|category|important information
 
@@ -563,55 +563,41 @@ async function indexChannel(
       const message
       of messages.values()
     ) {
-      if (!message.guild) {
-        continue;
-      }
-
       if (
-        !message.content ||
-        message.author.bot
+        !message.guild ||
+        message.author.bot ||
+        !message.content
       ) {
         continue;
       }
 
-      try {
-        db.prepare(`
-          INSERT OR IGNORE INTO indexed_messages (
-            guild_id,
-            channel_id,
-            message_id,
-            author_id,
-            content,
-            created_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(
-          message.guild.id,
-          channel.id,
-          message.id,
-          message.author.id,
-          clip(
-            message.content,
-            2000
-          ),
-          message.createdTimestamp
-        );
+      db.prepare(`
+        INSERT OR IGNORE INTO indexed_messages (
+          guild_id,
+          channel_id,
+          message_id,
+          author_id,
+          content,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        message.guild.id,
+        channel.id,
+        message.id,
+        message.author.id,
+        clip(message.content, 2000),
+        message.createdTimestamp
+      );
 
-        total++;
-      } catch (error) {
-        console.error(
-          "Index message error:",
-          error
-        );
-      }
+      total++;
     }
 
     before =
       messages.last()?.id;
 
     if (
-      messages.size <
-      batchSize
+      messages.size < batchSize
     ) {
       break;
     }
@@ -629,55 +615,45 @@ async function getMemberInformation(
   userId
 ) {
   try {
-    const member =
-      await guild.members.fetch(
+    const user =
+      await client.users.fetch(
         userId
       );
 
-    const roles =
-      member.roles.cache
-        .filter(role =>
-          role.id !== guild.id
-        )
-        .map(role =>
-          role.name
-        );
+    const member =
+      guild.members.cache.get(
+        userId
+      );
+
+    let roles = [];
+
+    if (member) {
+      roles =
+        member.roles.cache
+          .filter(role =>
+            role.id !== guild.id
+          )
+          .map(role =>
+            role.name
+          );
+    }
 
     return {
-      id: member.id,
-
-      username:
-        member.user.username,
-
-      tag:
-        member.user.tag,
-
+      id: user.id,
+      username: user.username,
+      tag: user.tag,
       displayName:
-        member.displayName,
-
+        member?.displayName ||
+        user.username,
       nickname:
-        member.nickname ||
-        null,
-
-      bot:
-        member.user.bot,
-
+        member?.nickname || null,
+      bot: user.bot,
       accountCreated:
-        new Date(
-          member.user.createdTimestamp
-        ).toISOString(),
-
+        user.createdTimestamp,
       joinedServer:
-        member.joinedTimestamp
-          ? new Date(
-              member.joinedTimestamp
-            ).toISOString()
-          : null,
-
+        member?.joinedTimestamp ||
+        null,
       roles,
-
-      roleCount:
-        roles.length,
     };
   } catch (error) {
     console.error(
@@ -760,7 +736,7 @@ async function renameRole(
       return {
         success: false,
         message:
-          "❌ That role is managed by Discord/integration and cannot be renamed.",
+          "❌ That role is managed by Discord and cannot be renamed.",
       };
     }
 
@@ -794,7 +770,7 @@ async function renameRole(
       return {
         success: false,
         message:
-          "❌ I can't rename that role because it is equal to or above my highest role.",
+          "❌ That role is equal to or above my highest role.",
       };
     }
 
@@ -825,7 +801,7 @@ async function renameRole(
 }
 
 // ======================================================
-// KICK MEMBER
+// KICK
 // ======================================================
 
 async function kickMember(
@@ -846,7 +822,7 @@ async function kickMember(
       return {
         success: false,
         message:
-          "I couldn't determine my permissions.",
+          "❌ I couldn't determine my permissions.",
       };
     }
 
@@ -858,7 +834,7 @@ async function kickMember(
       return {
         success: false,
         message:
-          "I don't have Kick Members permission.",
+          "❌ I don't have Kick Members permission.",
       };
     }
 
@@ -868,7 +844,7 @@ async function kickMember(
       return {
         success: false,
         message:
-          "I can't kick the server owner.",
+          "❌ I can't kick the server owner.",
       };
     }
 
@@ -879,7 +855,7 @@ async function kickMember(
       return {
         success: false,
         message:
-          "I can't kick that member because their highest role is equal to or above mine.",
+          "❌ I can't kick that member because their role is equal to or above mine.",
       };
     }
 
@@ -887,7 +863,7 @@ async function kickMember(
       return {
         success: false,
         message:
-          "Discord does not allow me to kick that member.",
+          "❌ Discord does not allow me to kick that member.",
       };
     }
 
@@ -912,19 +888,35 @@ async function kickMember(
     return {
       success: false,
       message:
-        "I couldn't kick that member.",
+        "❌ I couldn't kick that member.",
     };
   }
 }
 
 // ======================================================
-// ANNOUNCEMENT SYSTEM
+// ANNOUNCEMENTS
 // ======================================================
 
-async function generateAnnouncement(
-  guild,
-  request
+async function sendAnnouncement(
+  source,
+  request,
+  targetChannel = null
 ) {
+  const guild =
+    source.guild;
+
+  const channel =
+    targetChannel ||
+    source.channel;
+
+  if (!guild) {
+    return "❌ This can only be used inside a server.";
+  }
+
+  if (!channel?.isTextBased()) {
+    return "❌ I can't send an announcement there.";
+  }
+
   const memories =
     searchMemories(
       guild.id,
@@ -947,49 +939,31 @@ ${request}
 Create a clear Discord announcement.
 
 Rules:
-- Keep the meaning of the staff request.
-- Do not invent dates, events, rules, rewards, or information.
-- Make it easy to read.
+- Keep the meaning of the request.
+- Do not invent information.
 - Use Discord formatting when useful.
 - Emojis are allowed.
-- Do not add unnecessary explanations.
+- Keep it readable.
 `;
 
-  return generateAI(
-    prompt,
-    {
-      temperature: 0.5,
-      maxOutputTokens: 600,
-    }
-  );
-}
-
-async function sendAnnouncement(
-  message,
-  request,
-  targetChannel = null
-) {
-  const channel =
-    targetChannel ||
-    message.channel;
-
-  if (!channel?.isTextBased()) {
-    return "❌ I can't send an announcement there.";
-  }
-
   const announcement =
-    await generateAnnouncement(
-      message.guild,
-      request
+    await generateAI(
+      prompt,
+      {
+        temperature: 0.5,
+        maxOutputTokens: 600,
+      }
     );
 
   const wantsEveryone =
-    /\@(everyone|here)\b/i.test(
+    /@(everyone|here)\b/i.test(
       request
     );
 
   const mentionedUsers =
-    [...message.mentions.users.keys()];
+    source.mentions?.users
+      ? [...source.mentions.users.keys()]
+      : [];
 
   try {
     await channel.send({
@@ -1001,6 +975,7 @@ async function sendAnnouncement(
           wantsEveryone
             ? ["everyone"]
             : [],
+
         users:
           mentionedUsers,
       },
@@ -1018,7 +993,7 @@ async function sendAnnouncement(
 }
 
 // ======================================================
-// NATURAL STAFF INSTRUCTIONS
+// NATURAL STAFF COMMANDS
 // ======================================================
 
 async function handleStaffInstruction(
@@ -1033,9 +1008,7 @@ async function handleStaffInstruction(
     return false;
   }
 
-  // ----------------------------------------------------
   // ANNOUNCEMENT
-  // ----------------------------------------------------
 
   const announcementMatch =
     content.match(
@@ -1048,7 +1021,7 @@ async function handleStaffInstruction(
 
     if (!request) {
       await message.reply(
-        "📢 Sure. Tell me what you want announced."
+        "📢 Tell me what you want announced."
       );
 
       return true;
@@ -1079,26 +1052,20 @@ async function handleStaffInstruction(
     return true;
   }
 
-  // ----------------------------------------------------
   // VERBAL WARNING
-  // ----------------------------------------------------
 
   const warningMatch =
     content.match(
-            /\b(verbal\s+warn|warn|warning)\b[\s\S]*?<@!?(\d+)>([\s\S]*)/i
+      /\b(verbal\s+warn|warn|warning)\b[\s\S]*?<@!?(\d+)>([\s\S]*)/i
     );
 
   if (warningMatch) {
     const userId =
       warningMatch[2];
 
-    let reason =
-      warningMatch[3]?.trim();
-
-    if (!reason) {
-      reason =
-        "Staff verbal warning";
-    }
+    const reason =
+      warningMatch[3]?.trim() ||
+      "Staff verbal warning";
 
     const member =
       await message.guild.members
@@ -1127,9 +1094,7 @@ async function handleStaffInstruction(
     return true;
   }
 
-  // ----------------------------------------------------
   // KICK
-  // ----------------------------------------------------
 
   const kickMatch =
     content.match(
@@ -1158,9 +1123,7 @@ async function handleStaffInstruction(
     return true;
   }
 
-  // ----------------------------------------------------
   // ROLE RENAME
-  // ----------------------------------------------------
 
   const roleMention =
     content.match(
@@ -1168,6 +1131,7 @@ async function handleStaffInstruction(
     );
 
   const renameMatch =
+     
     content.match(
       /\b(rename|change)\b[\s\S]*?(?:role)[\s\S]*?(?:to|into)\s+["“]?([^"”]+)["”]?$/i
     );
@@ -1196,9 +1160,7 @@ async function handleStaffInstruction(
     return true;
   }
 
-  // ----------------------------------------------------
   // MEMBER INFORMATION
-  // ----------------------------------------------------
 
   const infoMatch =
     content.match(
@@ -1239,10 +1201,10 @@ async function handleStaffInstruction(
         `**ID:** \`${info.id}\``,
         `**Nickname:** ${info.nickname || "None"}`,
         `**Bot:** ${info.bot ? "Yes" : "No"}`,
-        `**Account Created:** <t:${Math.floor(new Date(info.accountCreated).getTime() / 1000)}:F>`,
+        `**Account Created:** <t:${Math.floor(info.accountCreated / 1000)}:F>`,
         `**Joined Server:** ${
           info.joinedServer
-            ? `<t:${Math.floor(new Date(info.joinedServer).getTime() / 1000)}:F>`
+            ? `<t:${Math.floor(info.joinedServer / 1000)}:F>`
             : "Unknown"
         }`,
         `**Roles:** ${roles}`,
@@ -1252,9 +1214,7 @@ async function handleStaffInstruction(
     return true;
   }
 
-  // ----------------------------------------------------
   // FALLBACK STAFF AI
-  // ----------------------------------------------------
 
   const memories =
     searchMemories(
@@ -1276,11 +1236,10 @@ ${content}
 
 Understand natural/ad-lib wording.
 
-If the request is asking for an action that the bot does not
-have an implemented action for, explain what you can do instead.
+If the request asks for an action that the bot does not
+have implemented, explain what you can do instead.
 
-Do not claim an action was completed unless the bot actually
-completed it.
+Do not claim an action was completed unless it actually was.
 `;
 
   const response =
@@ -1315,9 +1274,7 @@ function looksLikeTicket(channel) {
   );
 }
 
-async function handleTicketCreated(
-  channel
-) {
+async function handleTicketCreated(channel) {
   if (!looksLikeTicket(channel)) {
     return;
   }
@@ -1348,7 +1305,7 @@ async function handleTicketCreated(
     const prompt = `
 You are Underdog AI helping inside a Discord support ticket.
 
-Ticket channel:
+Ticket:
 ${channel.name}
 
 Recent messages:
@@ -1356,17 +1313,20 @@ ${recentMessages || "No messages yet."}
 
 Give a short helpful response.
 
-If the ticket does not contain enough information yet,
-ask the user what they need help with.
+If there is not enough information,
+ask what the user needs help with.
 
 Do not pretend to be a human staff member.
 `;
 
     const response =
-      await generateAI(prompt, {
-        temperature: 0.6,
-        maxOutputTokens: 400,
-      });
+      await generateAI(
+        prompt,
+        {
+          temperature: 0.6,
+          maxOutputTokens: 400,
+        }
+      );
 
     await channel.send({
       content: `🤖 ${response}`,
@@ -1599,18 +1559,19 @@ client.on(
     const command =
       interaction.commandName;
 
-    const staffCommands = new Set([
-      "remember",
-      "forget",
-      "setchannel",
-      "personality",
-      "indexchannel",
-      "indexserver",
-      "announce",
-      "warnings",
-      "memberinfo",
-      "memories",
-    ]);
+    const staffCommands =
+      new Set([
+        "remember",
+        "forget",
+        "setchannel",
+        "personality",
+        "indexchannel",
+        "indexserver",
+        "announce",
+        "warnings",
+        "memberinfo",
+        "memories",
+      ]);
 
     if (
       staffCommands.has(command) &&
@@ -1789,10 +1750,8 @@ client.on(
         const channels =
           guild.channels.cache.filter(
             channel =>
-              channel.type ===
-                ChannelType.GuildText ||
-              channel.type ===
-                ChannelType.GuildAnnouncement
+              channel.type === ChannelType.GuildText ||
+              channel.type === ChannelType.GuildAnnouncement
           );
 
         for (
@@ -1937,17 +1896,13 @@ client.on(
 
         const accountTimestamp =
           Math.floor(
-            new Date(
-              info.accountCreated
-            ).getTime() / 1000
+            info.accountCreated / 1000
           );
 
         const joinedTimestamp =
           info.joinedServer
             ? Math.floor(
-                new Date(
-                  info.joinedServer
-                ).getTime() / 1000
+                info.joinedServer / 1000
               )
             : null;
 
@@ -2032,6 +1987,8 @@ client.on(
       return;
     }
 
+    // AUTOMATIC MEMORY MONITOR
+
     const memoryChannelId =
       getSetting(
         message.guild.id,
@@ -2048,32 +2005,47 @@ client.on(
           message
         );
       } catch (error) {
-        console.error(          "Automatic memory error:",
+        console.error(
+          "Automatic memory error:",
           error
         );
       }
     }
+
+    // BOT MENTION
 
     const botMentioned =
       message.mentions.has(
         client.user.id
       );
 
+    // BOT REPLY
+
     let repliedToBot = false;
 
-    if (message.reference?.messageId) {
+    if (
+      message.reference?.messageId
+    ) {
       try {
-        const referenced =
-          await message.fetchReference();
+        const repliedMessage =
+          await message.channel.messages
+            .fetch(
+              message.reference.messageId
+            )
+            .catch(() => null);
 
         if (
-          referenced?.author?.id ===
-          client.user.id
+          repliedMessage &&
+          repliedMessage.author.id ===
+            client.user.id
         ) {
           repliedToBot = true;
         }
-      } catch {
-        // Ignore unavailable referenced messages.
+      } catch (error) {
+        console.error(
+          "Reply detection error:",
+          error
+        );
       }
     }
 
@@ -2084,42 +2056,34 @@ client.on(
       return;
     }
 
-    const content =
+    const cleanedContent =
       cleanBotMention(
         message.content
       );
 
-    if (!content) {
+    if (!cleanedContent) {
       await message.reply(
-        "🥊 Yo! What's up?"
+        "Yo 🥊 What's up?"
       );
 
       return;
     }
 
-    if (
-      isAuthorizedStaff(
-        message.member
-      )
-    ) {
-      const handled =
-        await handleStaffInstruction(
-          message,
-          content
-        );
+    const handled =
+      await handleStaffInstruction(
+        message,
+        cleanedContent
+      );
 
-      if (handled) {
-        return;
-      }
+    if (handled) {
+      return;
     }
 
     try {
-      await message.channel.sendTyping();
-
       const response =
         await answerUser(
           message,
-          content
+          cleanedContent
         );
 
       await message.reply(
@@ -2131,17 +2095,15 @@ client.on(
         error
       );
 
-      await message
-        .reply(
-          "⚠️ I couldn't process that right now."
-        )
-        .catch(() => {});
+      await message.reply(
+        "⚠️ I couldn't process that right now."
+      );
     }
   }
 );
 
 // ======================================================
-// ERROR HANDLING
+// ERRORS
 // ======================================================
 
 process.on(
@@ -2159,8 +2121,8 @@ process.on(
   error => {
     console.error(
       "Uncaught exception:",
-      error
-    );
+        error
+      );
   }
 );
 
@@ -2171,4 +2133,3 @@ process.on(
 client.login(
   DISCORD_TOKEN
 );
-     
